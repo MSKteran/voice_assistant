@@ -1,21 +1,27 @@
-import os
-import webbrowser
+import tkinter as tk
 import speech_recognition as sr
-import requests
-import re
+import threading
+import webbrowser
+import os
 from gtts import gTTS
 import pygame
-import pymorphy2
+import requests
+import pymorphy3
+import re
 
 # Настройки ассистента
 assistant_name = "Ассистент"
 openweather_api_key = "79d1ca96933b0328e1c7e3e7a26cb347"
 
-morph = pymorphy2.MorphAnalyzer(lang='ru')
+# Инициализация библиотеки для морфологического анализа
+morph = pymorphy3.MorphAnalyzer(lang='ru')
+
+# Глобальная переменная для режима
+is_voice_mode = False  # Режим по умолчанию: текстовый
 
 # Список приложений
 app_list = {
-    ("блокнот", "нотпад",): r"C:\Windows\System32\notepad.exe",
+    ("блокнот", "notepad",): r"C:\Windows\System32\notepad.exe",
     ("калькулятор",): r"C:\Windows\System32\calc.exe",
     ("браузер", "яндекс",): r"C:\Users\admin\AppData\Local\Yandex\YandexBrowser\Application\browser.exe",
     ("офис", "word",): r"C:\Program Files\Microsoft Office\root\Office16\WINWORD.EXE",
@@ -26,86 +32,55 @@ site_list = {
     ("вконтакте", "вк"): "https://www.vk.com",
 }
 
-# Функция для определения города по геолокации
-def get_location_from_ip(default_city):
-    try:
-        response = requests.get("http://ip-api.com/json/", params={"lang": "ru"}, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        city = data.get("city")
-        if city:
-            return city
-    except requests.exceptions.RequestException:
-        pass  # Если не удалось определить город, используем город по умолчанию
-    return default_city
-
-
-# город по умолчанию
-location = get_location_from_ip("Москва")
-
-# Функция для озвучивания текста
+# Функция озвучивания текста
 def speak(text):
     print(f"{assistant_name}: {text}")
+    update_ui(f"{assistant_name}: {text}")
     audio_file = "assistant_response.mp3"
     tts = gTTS(text=text, lang="ru")
     tts.save(audio_file)
 
-    # Воспроизведение через pygame
     pygame.mixer.init()
     pygame.mixer.music.load(audio_file)
     pygame.mixer.music.play()
 
-    while pygame.mixer.music.get_busy():  # Ждём завершения воспроизведения
+    while pygame.mixer.music.get_busy():
         continue
 
-    # Явная остановка и завершение работы pygame
     pygame.mixer.music.stop()
     pygame.mixer.quit()
-
-    # Удаление файла
     try:
         os.remove(audio_file)
     except PermissionError:
-        print("Не удалось удалить файл аудио. Возможно, он ещё используется.")
+        print("Не удалось удалить файл аудио.")
 
-# Функция для преобразования города и запроса для погоды
+# Падежи для города
 def normalize_text(text, case):
     try:
         parsed = morph.parse(text)[0]
-        if case == "nomn":
-            return parsed.inflect({"nomn"}).word.capitalize()
-        elif case == "loct":
-            return parsed.inflect({"loct"}).word.capitalize()
+        if case in {"nomn", "loct"}:
+            return parsed.inflect({case}).word.capitalize()
     except AttributeError:
         return text.capitalize()
 
-# Выбор правильного падежа для "градус"
-def get_proper_degree_phrase(temp):
-    temp = int(temp)
-    if 11 <= abs(temp) % 100 <= 14:  # Исключения для 11-14
-        degree_word = "градусов"
+# Функция обработки погоды
+def handle_weather(command):
+    city = re.sub(r"\bв\b", "", command.replace("погода", "").strip()).strip()
+    if not city:
+        city = "Москва"
+    city_nominative = normalize_text(city, "nomn")  # Для API
+    city_prepositional = normalize_text(city, "loct")  # Для озвучивания
+    weather, _ = get_weather(city_nominative)
+    if weather:
+        speak(f"Погода в {city_prepositional}: {weather}.")
     else:
-        last_digit = abs(temp) % 10
-        if last_digit == 1:
-            degree_word = "градус"
-        elif 2 <= last_digit <= 4:
-            degree_word = "градуса"
-        else:
-            degree_word = "градусов"
+        speak("Не удалось получить данные о погоде. Проверьте подключение к интернету.")
 
-    return f"{temp} {degree_word} по цельсию"
-
-# Функция для получения текущей погоды через OpenWeather
+# Функция получения погоды
 def get_weather(city):
-    city_nominative = normalize_text(city, "nomn")  # Преобразование в именительный падеж
     try:
         url = f"http://api.openweathermap.org/data/2.5/weather"
-        params = {
-            "q": city_nominative,
-            "appid": openweather_api_key,
-            "lang": "ru",
-            "units": "metric"
-        }
+        params = {"q": city, "appid": openweather_api_key, "lang": "ru", "units": "metric"}
         response = requests.get(url, params=params, timeout=5)
         response.raise_for_status()
         data = response.json()
@@ -116,41 +91,42 @@ def get_weather(city):
     except requests.exceptions.RequestException:
         return None, city
 
-# Функция для обработки запроса погоды
-def handle_weather(command):
-    # Удаление предлога "в"
-    city = re.sub(r"\bв\b", "", command.replace("погода", "").strip()).strip()
-    if not city:
-        city = location  # Если город не указан, использовать город по умолчанию
-
-    weather, normalized_city = get_weather(city)
-    if weather:
-        city_locative = normalize_text(normalized_city, "loct")  # Преобразование в предложный падеж
-        speak(f"Погода в {city_locative}: {weather}.")
+# Функция для правильного падежа слова "градус"
+def get_proper_degree_phrase(temp):
+    temp = int(temp)
+    if 11 <= abs(temp) % 100 <= 14:
+        degree_word = "градусов"
     else:
-        speak("Не удалось получить данные о погоде. Проверьте подключение к интернету.")
+        last_digit = abs(temp) % 10
+        if last_digit == 1:
+            degree_word = "градус"
+        elif 2 <= last_digit <= 4:
+            degree_word = "градуса"
+        else:
+            degree_word = "градусов"
+    return f"{temp} {degree_word} по Цельсию"
 
-# Функция для распознавания речи
-def listen_continuously():
-    recognizer = sr.Recognizer()
-    recognizer.pause_threshold = 1.5  # Увеличение времени ожидания между словами, но все равно иногда не распознает
-    with sr.Microphone() as source:
-        print(f"{assistant_name} слушает...")
-        while True:
-            try:
-                audio = recognizer.listen(source, timeout=None)
-                command = recognizer.recognize_google(audio, language='ru-RU').lower()
-                print(f"Распознанный текст: {command}")  # Вывод текста из микрофона
-                if assistant_name.lower() in command:
-                    return command.replace(assistant_name.lower(), "").strip()
-            except sr.UnknownValueError:
-                continue  # Игнорировать шум
-            except sr.RequestError:
-                speak("Проблема с подключением к интернету.")
-                break
-    return ""
+# Обработка команд
+def process_command(command, is_text_mode=False):
+    if is_text_mode or assistant_name.lower() in command:
+        command = command.replace(assistant_name.lower(), "").strip()
+        if "запусти" in command or "открой" in command:
+            open_application(command)
+        elif "погода" in command:
+            handle_weather(command)
+        elif "найди" in command or "загугли" in command:
+            search_internet(command)
+        elif "перейди на" in command:
+            go_to_website(command)
+        elif "выход" in command or "пока" in command:
+            speak("До свидания!")
+            root.quit()
+        else:
+            speak("Команда не распознана.")
+    else:
+        update_ui("Обращение не распознано.")
 
-# Функция запуска приложения из списка
+# Функция открытия приложения
 def open_application(command):
     for names, app_path in app_list.items():
         if any(name in command for name in names):
@@ -158,61 +134,91 @@ def open_application(command):
                 os.startfile(app_path)
                 speak(f"Запускаю {names[0]}.")
                 return
-            else:
-                speak(f"Приложение {names[0]} не найдено по указанному пути.")
-                return
     speak("Приложение не найдено в списке.")
 
-# Функция для перехода на сайт
-def go_to_website(command):
-    site_name = command.replace("перейди на", "").strip()
-    if not site_name:
-        speak("Не удалось найти сайт. Укажите название.")
-        return
-    for names, url in site_list.items():
-        if any(name in site_name for name in names):
-            webbrowser.open(url)
-            speak(f"Открываю {site_name}.")
-            return
-    # Если сайт не найден в списке, пытаемся открыть с расширением .com
-    webbrowser.open(f"https://www.{site_name}.com")
-    speak(f"Пытаюсь открыть {site_name}.")
-
-# Функция для поиска в интернете
+# Функция поиска в интернете
 def search_internet(command):
     query = command.replace("найди", "").replace("загугли", "").strip()
-    words = query.split()
-    if words:
-        query = " ".join([normalize_text(words[0], "nomn")] + words[1:])
+    if query:
+        words = query.split()
+        if words:
+            words[0] = normalize_text(words[0], "nomn")
+        query = " ".join(words)
         webbrowser.open(f"https://www.google.com/search?q={query}")
         speak(f"Ищу {query} в интернете.")
     else:
         speak("Не указан запрос для поиска.")
 
-# Завершение программы
-def exit_program():
-    speak("До свидания!")
-    exit()
+# Функция открытия сайта
+def go_to_website(command):
+    site_name = command.replace("перейди на", "").strip()
+    for names, url in site_list.items():
+        if any(name in site_name for name in names):
+            webbrowser.open(url)
+            speak(f"Открываю {names[0]}.")
+            return
+    webbrowser.open(f"https://www.{site_name}.com")
+    speak(f"Пытаюсь открыть {site_name}.")
 
-# Функция обработки команд
-def process_command(command):
-    if "запусти" in command or "открой" in command:
-        open_application(command)
-    elif "погода" in command:
-        handle_weather(command)
-    elif "найди" in command or "загугли" in command:
-        search_internet(command)
-    elif "перейди на" in command:
-        go_to_website(command)
-    elif "выход" in command or "стоп" in command or "пока" in command:
-        speak("До свидания!")
-        exit()
+# Функция для голосового ввода
+def listen_continuously():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        recognizer.adjust_for_ambient_noise(source)
+        update_ui("Слушаю...")
+        while is_voice_mode:
+            try:
+                audio = recognizer.listen(source, timeout=None)  # Без тайм-аута
+                command = recognizer.recognize_google(audio, language="ru-RU").lower()
+                update_ui(f"Вы: {command}")
+                process_command(command)
+                update_ui("Слушаю...")  # Обновить после обработки команды
+            except sr.UnknownValueError:
+                update_ui("Вы: [неразборчиво]")
+
+# Переключение голосового режима
+def toggle_voice_mode():
+    global is_voice_mode
+    is_voice_mode = not is_voice_mode
+    if is_voice_mode:
+        voice_button.config(bg="green")
+        update_ui("Голосовой режим включен.")
+        threading.Thread(target=listen_continuously, daemon=True).start()
     else:
-        speak("Команда не распознана.")
+        voice_button.config(bg="SystemButtonFace")
+        update_ui("Голосовой режим выключен.")
 
-# Главный цикл программы
-if __name__ == "__main__":
-    speak(f"Здравствуйте! Вы можете обращаться ко мне как {assistant_name}.")
-    while True:
-        user_command = listen_continuously()
-        process_command(user_command)
+# Обновление интерфейса
+def update_ui(text):
+    text_area.config(state=tk.NORMAL)
+    text_area.insert(tk.END, f"{text}\n")
+    text_area.yview(tk.END)
+    text_area.config(state=tk.DISABLED)
+
+# Интерфейс
+root = tk.Tk()
+root.title("Голосовой помощник")
+
+text_area = tk.Text(root, height=10, width=50, wrap=tk.WORD, state=tk.DISABLED)
+text_area.pack(padx=20, pady=20)
+
+entry = tk.Entry(root, width=50)
+entry.pack(padx=20, pady=10)
+
+def process_text_command(event=None):
+    command = entry.get()
+    entry.delete(0, tk.END)
+    if command:
+        update_ui(f"Вы: {command}")
+        process_command(command.lower(), is_text_mode=True)
+
+entry.bind("<Return>", process_text_command)
+
+send_button = tk.Button(root, text="Отправить", width=20, height=2, command=process_text_command)
+send_button.pack(pady=10)
+
+voice_button = tk.Button(root, text="Голосовой режим", width=20, height=2, command=toggle_voice_mode)
+voice_button.pack(pady=10)
+
+speak("Привет! Чем могу помочь?")
+root.mainloop()
